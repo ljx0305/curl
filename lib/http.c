@@ -5,7 +5,7 @@
  *                            | (__| |_| |  _ <| |___
  *                             \___|\___/|_| \_\_____|
  *
- * Copyright (C) 1998 - 2015, Daniel Stenberg, <daniel@haxx.se>, et al.
+ * Copyright (C) 1998 - 2016, Daniel Stenberg, <daniel@haxx.se>, et al.
  *
  * This software is licensed as described in the file COPYING, which
  * you should have received as part of this distribution. The terms
@@ -462,7 +462,7 @@ static CURLcode http_perhapsrewind(struct connectdata *conn)
 #endif
 
     /* This is not NTLM or many bytes left to send: close */
-    connclose(conn, "Mid-auth HTTP and much data left to send");
+    streamclose(conn, "Mid-auth HTTP and much data left to send");
     data->req.size = 0; /* don't download any more than 0 bytes */
 
     /* There still is data left to send, but this connection is marked for
@@ -1452,9 +1452,8 @@ CURLcode Curl_http_done(struct connectdata *conn,
 {
   struct Curl_easy *data = conn->data;
   struct HTTP *http = data->req.protop;
-#ifdef USE_NGHTTP2
-  struct http_conn *httpc = &conn->proto.httpc;
-#endif
+
+  infof(data, "Curl_http_done: called premature == %d\n", premature);
 
   Curl_unencode_cleanup(conn);
 
@@ -1467,7 +1466,7 @@ CURLcode Curl_http_done(struct connectdata *conn,
      * Do not close CONNECT_ONLY connections. */
     if((data->req.httpcode != 401) && (data->req.httpcode != 407) &&
        !data->set.connect_only)
-      connclose(conn, "Negotiate transfer completed");
+      streamclose(conn, "Negotiate transfer completed");
     Curl_cleanup_negotiate(data);
   }
 #endif
@@ -1484,27 +1483,7 @@ CURLcode Curl_http_done(struct connectdata *conn,
     http->send_buffer = NULL; /* clear the pointer */
   }
 
-#ifdef USE_NGHTTP2
-  if(http->header_recvbuf) {
-    DEBUGF(infof(data, "free header_recvbuf!!\n"));
-    Curl_add_buffer_free(http->header_recvbuf);
-    http->header_recvbuf = NULL; /* clear the pointer */
-    Curl_add_buffer_free(http->trailer_recvbuf);
-    http->trailer_recvbuf = NULL; /* clear the pointer */
-    if(http->push_headers) {
-      /* if they weren't used and then freed before */
-      for(; http->push_headers_used > 0; --http->push_headers_used) {
-        free(http->push_headers[http->push_headers_used - 1]);
-      }
-      free(http->push_headers);
-      http->push_headers = NULL;
-    }
-  }
-  if(http->stream_id) {
-    nghttp2_session_set_stream_user_data(httpc->h2, http->stream_id, 0);
-    http->stream_id = 0;
-  }
-#endif
+  Curl_http2_done(conn, premature);
 
   if(HTTPREQ_POST_FORM == data->set.httpreq) {
     data->req.bytecount = http->readbytecount + http->writebytecount;
@@ -1668,6 +1647,10 @@ CURLcode Curl_add_custom_headers(struct connectdata *conn,
                   /* when asking for Transfer-Encoding, don't pass on a custom
                      Connection: */
                   checkprefix("Connection", headers->data))
+            ;
+          else if((conn->httpversion == 20) &&
+                  checkprefix("Transfer-Encoding:", headers->data))
+            /* HTTP/2 doesn't support chunked requests */
             ;
           else {
             CURLcode result = Curl_add_bufferf(req_buffer, "%s\r\n",
@@ -1955,40 +1938,35 @@ CURLcode Curl_http(struct connectdata *conn, bool *done)
   }
 #endif
 
-  if(conn->httpversion == 20)
-    /* In HTTP2 forbids Transfer-Encoding: chunked */
-    ptr = NULL;
+  ptr = Curl_checkheaders(conn, "Transfer-Encoding:");
+  if(ptr) {
+    /* Some kind of TE is requested, check if 'chunked' is chosen */
+    data->req.upload_chunky =
+      Curl_compareheader(ptr, "Transfer-Encoding:", "chunked");
+  }
   else {
-    ptr = Curl_checkheaders(conn, "Transfer-Encoding:");
-    if(ptr) {
-      /* Some kind of TE is requested, check if 'chunked' is chosen */
-      data->req.upload_chunky =
-        Curl_compareheader(ptr, "Transfer-Encoding:", "chunked");
-    }
-    else {
-      if((conn->handler->protocol&PROTO_FAMILY_HTTP) &&
-         data->set.upload &&
-         (data->state.infilesize == -1)) {
-        if(conn->bits.authneg)
-          /* don't enable chunked during auth neg */
-          ;
-        else if(use_http_1_1plus(data, conn)) {
-          /* HTTP, upload, unknown file size and not HTTP 1.0 */
-          data->req.upload_chunky = TRUE;
-        }
-        else {
-          failf(data, "Chunky upload is not supported by HTTP 1.0");
-          return CURLE_UPLOAD_FAILED;
-        }
+    if((conn->handler->protocol&PROTO_FAMILY_HTTP) &&
+       data->set.upload &&
+       (data->state.infilesize == -1)) {
+      if(conn->bits.authneg)
+        /* don't enable chunked during auth neg */
+        ;
+      else if(use_http_1_1plus(data, conn)) {
+        /* HTTP, upload, unknown file size and not HTTP 1.0 */
+        data->req.upload_chunky = TRUE;
       }
       else {
-        /* else, no chunky upload */
-        data->req.upload_chunky = FALSE;
+        failf(data, "Chunky upload is not supported by HTTP 1.0");
+        return CURLE_UPLOAD_FAILED;
       }
-
-      if(data->req.upload_chunky)
-        te = "Transfer-Encoding: chunked\r\n";
     }
+    else {
+      /* else, no chunky upload */
+      data->req.upload_chunky = FALSE;
+    }
+
+    if(data->req.upload_chunky)
+      te = "Transfer-Encoding: chunked\r\n";
   }
 
   Curl_safefree(conn->allocptr.host);
@@ -2782,6 +2760,11 @@ CURLcode Curl_http(struct connectdata *conn, bool *done)
     }
   }
 
+  if((conn->httpversion == 20) && data->req.upload_chunky)
+    /* upload_chunky was set above to set up the request in a chunky fashion,
+       but is disabled here again to avoid that the chunked encoded version is
+       actually used when sending the request body over h2 */
+    data->req.upload_chunky = FALSE;
   return result;
 }
 
@@ -3118,7 +3101,7 @@ CURLcode Curl_http_readwrite_headers(struct Curl_easy *data,
              signal the end of the document. */
           infof(data, "no chunk, no close, no size. Assume close to "
                 "signal end\n");
-          connclose(conn, "HTTP: No end-of-message indicator");
+          streamclose(conn, "HTTP: No end-of-message indicator");
         }
       }
 
@@ -3198,12 +3181,21 @@ CURLcode Curl_http_readwrite_headers(struct Curl_easy *data,
              * connection for closure after we've read the entire response.
              */
             if(!k->upload_done) {
-              infof(data, "HTTP error before end of send, stop sending\n");
-              connclose(conn, "Stop sending data before everything sent");
-              k->upload_done = TRUE;
-              k->keepon &= ~KEEP_SEND; /* don't send */
-              if(data->state.expect100header)
-                k->exp100 = EXP100_FAILED;
+              if(data->set.http_keep_sending_on_error) {
+                infof(data, "HTTP error before end of send, keep sending\n");
+                if(k->exp100 > EXP100_SEND_DATA) {
+                  k->exp100 = EXP100_SEND_DATA;
+                  k->keepon |= KEEP_SEND;
+                }
+              }
+              else {
+                infof(data, "HTTP error before end of send, stop sending\n");
+                streamclose(conn, "Stop sending data before everything sent");
+                k->upload_done = TRUE;
+                k->keepon &= ~KEEP_SEND; /* don't send */
+                if(data->state.expect100header)
+                  k->exp100 = EXP100_FAILED;
+              }
             }
             break;
 
@@ -3503,7 +3495,7 @@ CURLcode Curl_http_readwrite_headers(struct Curl_easy *data,
         /* Negative Content-Length is really odd, and we know it
            happens for example when older Apache servers send large
            files */
-        connclose(conn, "negative content-length");
+        streamclose(conn, "negative content-length");
         infof(data, "Negative content-length: %" CURL_FORMAT_CURL_OFF_T
               ", closing after transfer\n", contentlength);
       }
@@ -3576,7 +3568,7 @@ CURLcode Curl_http_readwrite_headers(struct Curl_easy *data,
        * the connection will close when this request has been
        * served.
        */
-      connclose(conn, "Connection: close used");
+      streamclose(conn, "Connection: close used");
     }
     else if(checkprefix("Transfer-Encoding:", k->p)) {
       /* One or more encodings. We check for chunked and/or a compression

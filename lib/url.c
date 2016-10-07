@@ -782,6 +782,10 @@ CURLcode Curl_setopt(struct Curl_easy *data, CURLoption option,
      */
     data->set.http_fail_on_error = (0 != va_arg(param, long)) ? TRUE : FALSE;
     break;
+  case CURLOPT_KEEP_SENDING_ON_ERROR:
+    data->set.http_keep_sending_on_error = (0 != va_arg(param, long)) ?
+                                           TRUE : FALSE;
+    break;
   case CURLOPT_UPLOAD:
   case CURLOPT_PUT:
     /*
@@ -2827,6 +2831,17 @@ CURLcode Curl_disconnect(struct connectdata *conn, bool dead_connection)
 
   if(!data) {
     DEBUGF(fprintf(stderr, "DISCONNECT without easy handle, ignoring\n"));
+    return CURLE_OK;
+  }
+
+  /*
+   * If this connection isn't marked to force-close, leave it open if there
+   * are other users of it
+   */
+  if(!conn->bits.close &&
+     (conn->send_pipe->size + conn->recv_pipe->size)) {
+    DEBUGF(infof(data, "Curl_disconnect, usecounter: %d\n",
+                 conn->send_pipe->size + conn->recv_pipe->size));
     return CURLE_OK;
   }
 

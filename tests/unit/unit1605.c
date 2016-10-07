@@ -1,5 +1,3 @@
-#ifndef HEADER_CURL_STRDUP_H
-#define HEADER_CURL_STRDUP_H
 /***************************************************************************
  *                                  _   _ ____  _
  *  Project                     ___| | | |  _ \| |
@@ -21,11 +19,31 @@
  * KIND, either express or implied.
  *
  ***************************************************************************/
-#include "curl_setup.h"
+#include "curlcheck.h"
 
-#ifndef HAVE_STRDUP
-extern char *curlx_strdup(const char *str);
-#endif
-void *Curl_memdup(const void *src, size_t buffer_length);
+#include "llist.h"
 
-#endif /* HEADER_CURL_STRDUP_H */
+static CURLcode unit_setup(void)
+{
+  return CURLE_OK;
+}
+
+static void unit_stop(void)
+{
+
+}
+
+UNITTEST_START
+  CURL *easy = curl_easy_init();
+  int len;
+  char *esc;
+
+  esc = curl_easy_escape(easy, "", -1);
+  fail_unless(esc == NULL, "negative string length can't work");
+
+  esc = curl_easy_unescape(easy, "%41%41%41%41", -1, &len);
+  fail_unless(esc == NULL, "negative string length can't work");
+
+  curl_easy_cleanup(easy);
+
+UNITTEST_STOP
